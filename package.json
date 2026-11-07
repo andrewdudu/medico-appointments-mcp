@@ -1,0 +1,21 @@
+{
+  "name": "medico-appointments-mcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "bin": {
+    "medico-appointments-mcp": "server.js"
+  }
+}
