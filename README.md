@@ -1,6 +1,7 @@
 # medico-appointments-mcp
 
-Read-only MCP server (stdio) for the medico-service `appointments` table in Postgres.
+Read-only MCP server for the medico-service `appointments` table in Postgres.
+Runs over stdio (local, unrestricted) or Streamable HTTP (remote, medico-service JWT auth, scoped per outlet).
 Every connection runs with `default_transaction_read_only=on`, so it cannot change data.
 
 ## Tools
@@ -29,8 +30,64 @@ Claude Desktop (`claude_desktop_config.json`):
   "env": { "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/medico" } } } }
 ```
 
+## HTTP mode (remote, e.g. a GCP VM)
+Set `PORT` and the server listens on `http://$HOST:$PORT/mcp` (`HOST` defaults to `127.0.0.1`).
+
+| Env | Meaning |
+|-----|---------|
+| `PORT` | Enables HTTP mode |
+| `HOST` | Bind address, default `127.0.0.1`. Keep it local and put a TLS proxy in front |
+| `JWT_SECRET` | Required. Same value as medico-service `token.jwt.token-secret` |
+| `COOKIE_SECRET` | Optional. medico-service `SecurityCipher` key, so the encrypted `accessToken` cookie value is accepted as a token |
+| `DATABASE_URL` | As above |
+
+Auth mirrors medico-service: `Authorization: Bearer <token>`, where the token is either the raw JWT or the
+`accessToken` cookie value (needs `COOKIE_SECRET`). The token must be a valid, unexpired HS512 JWT whose `sub`
+is a user that is not deleted. The caller only sees outlets where that user has `APPOINTMENT_MONITORING` in
+`user_authorities`, the same check the app does for `/api/appointments/**`.
+
+The read-only role also needs:
+```sql
+GRANT SELECT (id, name, mark_for_delete) ON users TO medico_mcp;
+GRANT SELECT (user_id, outlet_id, authority) ON user_authorities TO medico_mcp;
+```
+
+### VM setup
+```
+git clone https://github.com/andrewdudu/medico-appointments-mcp /opt/medico-mcp && cd /opt/medico-mcp && npm ci --omit=dev
+```
+`/etc/systemd/system/medico-mcp.service`:
+```ini
+[Unit]
+Description=medico MCP
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/opt/medico-mcp
+ExecStart=/usr/bin/node server.js
+EnvironmentFile=/etc/medico-mcp.env
+Restart=always
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+`/etc/medico-mcp.env` (`chmod 600`): `PORT=3000`, `JWT_SECRET=...`, `COOKIE_SECRET=...`, `DATABASE_URL=...`. Then
+`sudo systemctl enable --now medico-mcp`.
+
+TLS (bearer tokens must never travel over plain HTTP), e.g. Caddy with a DNS name pointing at the VM, and GCP
+firewall open on 80/443 only:
+```
+sudo caddy reverse-proxy --from mcp.example.com --to 127.0.0.1:3000
+```
+
+Client:
+```
+claude mcp add --transport http medico https://mcp.example.com/mcp --header "Authorization: Bearer <token>"
+```
+
 ## Test
-Needs an empty throwaway Postgres DB (the test drops and recreates tables):
+Needs an empty throwaway Postgres DB (the test drops and recreates tables). Covers stdio and HTTP auth:
 ```
 TEST_DATABASE_URL=postgresql://postgres@localhost:5432/medico_test npm test
 ```
