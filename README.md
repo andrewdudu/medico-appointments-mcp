@@ -2,6 +2,8 @@
 
 Read-only MCP server for the medico-service `appointments` table in Postgres.
 Runs over stdio (local, unrestricted) or Streamable HTTP (remote, medico-service JWT auth, scoped per outlet).
+In HTTP mode it can also show a "Sign in to Medico" page, so users connect with their normal username and password
+and never handle a token.
 Every connection runs with `default_transaction_read_only=on`, so it cannot change data.
 
 ## Tools
@@ -40,11 +42,21 @@ Set `PORT` and the server listens on `http://$HOST:$PORT/mcp` (`HOST` defaults t
 | `JWT_SECRET` | Required. Same value as medico-service `token.jwt.token-secret` |
 | `COOKIE_SECRET` | Optional. medico-service `SecurityCipher` key, so the encrypted `accessToken` cookie value is accepted as a token |
 | `DATABASE_URL` | As above |
+| `MEDICO_LOGIN_URL` | Enables the sign-in page, e.g. `https://medicosystem.com/api/login`. Needs `PUBLIC_URL` and `COOKIE_SECRET` |
+| `PUBLIC_URL` | Public HTTPS origin of this server, e.g. `https://mcp.example.com` |
 
 Auth mirrors medico-service: `Authorization: Bearer <token>`, where the token is either the raw JWT or the
 `accessToken` cookie value (needs `COOKIE_SECRET`). The token must be a valid, unexpired HS512 JWT whose `sub`
 is a user that is not deleted. The caller only sees outlets where that user has `APPOINTMENT_MONITORING` in
 `user_authorities`, the same check the app does for `/api/appointments/**`.
+
+### Sign-in page (OAuth)
+With `MEDICO_LOGIN_URL` set, the server is a standard MCP OAuth server. A client that connects without a token is
+sent to a sign-in page on this server. The username and password go to medico-service's own `/api/login`, so
+passwords are checked by medico-service and never pass through Claude. The JWT it returns becomes the access token.
+Users without `APPOINTMENT_MONITORING` on any outlet are refused at sign-in. Tokens last as long as medico-service
+makes them (7 days); after that the client opens the sign-in page again. The sign-in form is rate limited to
+20 attempts per 15 minutes per IP.
 
 The read-only role also needs:
 ```sql
@@ -72,7 +84,8 @@ DynamicUser=yes
 [Install]
 WantedBy=multi-user.target
 ```
-`/etc/medico-mcp.env` (`chmod 600`): `PORT=3000`, `JWT_SECRET=...`, `COOKIE_SECRET=...`, `DATABASE_URL=...`. Then
+`/etc/medico-mcp.env` (`chmod 600`): `PORT=3000`, `JWT_SECRET=...`, `COOKIE_SECRET=...`, `DATABASE_URL=...`,
+`MEDICO_LOGIN_URL=https://medicosystem.com/api/login`, `PUBLIC_URL=https://mcp.example.com`. Then
 `sudo systemctl enable --now medico-mcp`.
 
 TLS (bearer tokens must never travel over plain HTTP), e.g. Caddy with a DNS name pointing at the VM, and GCP
@@ -81,10 +94,11 @@ firewall open on 80/443 only:
 sudo caddy reverse-proxy --from mcp.example.com --to 127.0.0.1:3000
 ```
 
-Client:
-```
-claude mcp add --transport http medico https://mcp.example.com/mcp --header "Authorization: Bearer <token>"
-```
+Clients (with the sign-in page):
+- Claude Desktop / claude.ai: Settings, Connectors, Add custom connector, URL `https://mcp.example.com/mcp`, then Connect.
+- Claude Code: `claude mcp add --transport http medico https://mcp.example.com/mcp`, then `/mcp` in a session to sign in.
+
+Without the sign-in page, pass a token yourself: `--header "Authorization: Bearer <token>"`.
 
 ## Test
 Needs an empty throwaway Postgres DB (the test drops and recreates tables). Covers stdio and HTTP auth:

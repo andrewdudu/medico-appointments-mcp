@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 // Read-only MCP server over the medico-service Postgres `appointments` table.
-// stdio by default; set PORT to serve Streamable HTTP with medico-service JWT auth.
-import http from "node:http";
+// stdio by default; set PORT to serve Streamable HTTP with medico-service JWT auth (plus OAuth sign-in with MEDICO_LOGIN_URL).
+import express from "express";
+import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { z } from "zod";
 import pg from "pg";
 
@@ -51,7 +55,7 @@ function createServer(allowedOutlets) {
     return outletId ? [outletId] : allowedOutlets;
   };
 
-  const server = new McpServer({ name: "medico-appointments", version: "1.1.0" });
+  const server = new McpServer({ name: "medico-appointments", version: "1.2.0" });
 
   server.registerTool(
     "list_appointments",
@@ -140,6 +144,8 @@ function createServer(allowedOutlets) {
 
 // --- medico-service auth (mirrors TokenHelper / SecurityCipher / ServerRequestHelper) ---
 
+const { JWT_SECRET, COOKIE_SECRET, MEDICO_LOGIN_URL, PUBLIC_URL } = process.env;
+
 // jjwt 0.9.0 base64-decodes the secret with DatatypeConverter, which ignores a trailing partial group
 // ("tokensecret" -> 6 bytes); Node's decoder would keep it, so cut to whole 4-char groups first.
 const jjwtKey = (secret) => {
@@ -147,7 +153,7 @@ const jjwtKey = (secret) => {
   return Buffer.from(clean.slice(0, clean.length - (clean.length % 4)), "base64");
 };
 
-// Returns the token subject (user id) if it is a valid, unexpired HS512 JWT, else null.
+// Returns { sub, exp } if token is a valid, unexpired HS512 JWT, else null.
 function verifyJwt(token, secret, now = Date.now()) {
   const [h, p, sig, extra] = token.split(".");
   if (!h || !p || !sig || extra !== undefined) return null;
@@ -158,7 +164,7 @@ function verifyJwt(token, secret, now = Date.now()) {
     if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;
     const claims = JSON.parse(Buffer.from(p, "base64url"));
     if (typeof claims.exp !== "number" || claims.exp * 1000 <= now) return null;
-    return typeof claims.sub === "string" ? claims.sub : null;
+    return typeof claims.sub === "string" ? { sub: claims.sub, exp: claims.exp } : null;
   } catch {
     return null;
   }
@@ -175,47 +181,170 @@ function decryptCookie(value, cookieSecret) {
   }
 }
 
-// Bearer value may be the raw JWT or the `accessToken` cookie value. Returns allowed outlet ids, or null if unauthorized.
-async function authenticate(authorization) {
-  const m = /^Bearer\s+(\S+)$/i.exec(authorization ?? "");
-  if (!m) return null;
-  let token = m[1];
-  if (!token.includes(".") && process.env.COOKIE_SECRET) token = decryptCookie(token, process.env.COOKIE_SECRET) ?? "";
-  const userId = verifyJwt(token, process.env.JWT_SECRET);
-  if (!userId) return null;
+// Token may be the raw JWT or the `accessToken` cookie value. Returns { outlets, exp }, or null if unauthorized.
+async function authenticate(token) {
+  if (!token.includes(".") && COOKIE_SECRET) token = decryptCookie(token, COOKIE_SECRET) ?? "";
+  const jwt = verifyJwt(token, JWT_SECRET);
+  if (!jwt) return null;
   const { rows } = await pool.query(
     `SELECT DISTINCT ua.outlet_id FROM users u JOIN user_authorities ua ON ua.user_id = u.id
      WHERE u.id = $1 AND NOT u.mark_for_delete AND ua.authority = 'APPOINTMENT_MONITORING'`,
-    [userId],
+    [jwt.sub],
   );
-  return rows.length ? rows.map((r) => r.outlet_id) : null;
+  return rows.length ? { outlets: rows.map((r) => r.outlet_id), exp: jwt.exp } : null;
 }
 
-const send = (res, status, body, headers = {}) =>
-  res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body));
+// Signs in through medico-service's own /api/login and returns the raw JWT, or null on bad credentials.
+async function medicoLogin(username, password) {
+  const r = await fetch(MEDICO_LOGIN_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+    redirect: "manual",
+  });
+  if (!r.ok) return null;
+  const cookie = r.headers.getSetCookie().map((c) => /^accessToken=([^;]+)/.exec(c)?.[1]).find(Boolean);
+  const jwt = cookie && decryptCookie(cookie, COOKIE_SECRET);
+  return jwt && verifyJwt(jwt, JWT_SECRET) ? jwt : null;
+}
+
+// --- OAuth: lets MCP clients sign users in on a web page instead of pasting tokens ---
+
+const randomId = () => crypto.randomBytes(32).toString("base64url");
+const remember = (map, key, value, ms) => { map.set(key, value); setTimeout(() => map.delete(key), ms).unref(); };
+const pending = new Map(); // login page id -> authorize params, 10 min
+const codes = new Map(); // authorization code -> { clientId, codeChallenge, redirectUri, jwt }, 5 min
+
+// Registered clients are stored inside a signed client_id, so registrations survive restarts with no database.
+// The client_secret (confidential clients only) is derived from the client_id and never stored.
+const clientKey = crypto.createHash("sha256").update(`oauth-clients:${JWT_SECRET}`).digest();
+const mac = (s) => crypto.createHmac("sha256", clientKey).update(s).digest("base64url");
+const withSecret = (info, clientId) =>
+  info.token_endpoint_auth_method === "none" ? { ...info, client_id: clientId } : { ...info, client_id: clientId, client_secret: mac(`secret:${clientId}`) };
+const clientsStore = {
+  registerClient({ client_id, client_secret, ...info }) {
+    const body = Buffer.from(JSON.stringify(info)).toString("base64url");
+    return withSecret(info, `${body}.${mac(body)}`);
+  },
+  getClient(clientId) {
+    const [body, sig] = clientId.split(".");
+    if (!body || !sig || sig.length !== mac(body).length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(mac(body)))) return undefined;
+    return withSecret(JSON.parse(Buffer.from(body, "base64url")), clientId);
+  },
+};
+
+const takeCode = (client, code) => {
+  const c = codes.get(code);
+  if (!c || c.clientId !== client.client_id) throw new InvalidGrantError("Invalid or expired authorization code");
+  return c;
+};
+
+const provider = {
+  clientsStore,
+  async authorize(client, params, res) {
+    const id = randomId();
+    remember(pending, id, { clientId: client.client_id, ...params }, 10 * 60_000);
+    loginPage(res, id);
+  },
+  async challengeForAuthorizationCode(client, code) {
+    return takeCode(client, code).codeChallenge;
+  },
+  async exchangeAuthorizationCode(client, code, _verifier, redirectUri) {
+    const c = takeCode(client, code);
+    if (redirectUri && redirectUri !== c.redirectUri) throw new InvalidGrantError("redirect_uri mismatch");
+    codes.delete(code);
+    const { exp } = verifyJwt(c.jwt, JWT_SECRET) ?? {};
+    if (!exp) throw new InvalidGrantError("Sign-in expired, try again");
+    return { access_token: c.jwt, token_type: "bearer", expires_in: Math.floor(exp - Date.now() / 1000) };
+  },
+  async exchangeRefreshToken() {
+    throw new InvalidGrantError("Refresh tokens are not supported, sign in again");
+  },
+  async verifyAccessToken(token) {
+    const a = await authenticate(token);
+    if (!a) throw new InvalidTokenError("Invalid or expired token");
+    return { token, clientId: "medico", scopes: [], expiresAt: a.exp, extra: { outlets: a.outlets } };
+  },
+};
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+function loginPage(res, id, error = "", status = 200) {
+  res
+    .status(status)
+    .set({ "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'", "cache-control": "no-store" })
+    .type("html")
+    .send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in to Medico</title><style>
+body{font:16px system-ui,sans-serif;background:#f4f5f7;color:#1d2127;margin:0;display:grid;place-items:center;min-height:100vh}
+form{background:#fff;padding:32px;border-radius:12px;box-shadow:0 2px 12px #0001;width:min(360px,calc(100vw - 32px));box-sizing:border-box}
+h1{font-size:22px;margin:0 0 8px}p{margin:0 0 20px;color:#555}label{display:block;margin:12px 0 4px;font-weight:600}
+input{width:100%;box-sizing:border-box;padding:10px;font:inherit;border:1px solid #bbb;border-radius:8px}
+button{margin-top:20px;width:100%;padding:12px;font:inherit;font-weight:600;border:0;border-radius:8px;background:#1663d6;color:#fff;cursor:pointer}
+.err{color:#b00020;margin:0 0 12px}
+@media (prefers-color-scheme:dark){body{background:#15171a;color:#eee}form{background:#22252a}p{color:#aaa}input{background:#15171a;color:#eee;border-color:#555}.err{color:#ff8a80}}
+</style></head><body><form method="post" action="login">
+<h1>Sign in to Medico</h1><p>Use your usual Medico username and password to let Claude read appointments.</p>
+${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
+<input type="hidden" name="id" value="${esc(id)}">
+<label for="u">Username</label><input id="u" name="username" autocomplete="username" required autofocus>
+<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button></form></body></html>`);
+}
 
 if (process.env.PORT) {
-  if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required in HTTP mode");
+  if (!JWT_SECRET) throw new Error("JWT_SECRET is required in HTTP mode");
+  const oauth = Boolean(MEDICO_LOGIN_URL);
+  if (oauth && (!PUBLIC_URL || !COOKIE_SECRET)) throw new Error("MEDICO_LOGIN_URL needs PUBLIC_URL and COOKIE_SECRET");
   const host = process.env.HOST ?? "127.0.0.1";
-  http
-    .createServer(async (req, res) => {
-      if (new URL(req.url, "http://x").pathname !== "/mcp") return send(res, 404, { error: "not found" });
-      // Stateless mode: no sessions, so only POST is meaningful.
-      if (req.method !== "POST") return send(res, 405, { error: "method not allowed" }, { allow: "POST" });
+  const app = express();
+  app.set("trust proxy", "loopback"); // real client IP for rate limiting behind a local TLS proxy
+
+  if (oauth) {
+    const issuerUrl = new URL(PUBLIC_URL);
+    app.use(mcpAuthRouter({ provider, issuerUrl, resourceServerUrl: new URL("/mcp", issuerUrl), resourceName: "Medico appointments" }));
+    // Slows password guessing through this page; medico-service may have no limit of its own.
+    app.post("/login", rateLimit({ windowMs: 15 * 60_000, limit: 20 }), express.urlencoded({ extended: false }), async (req, res) => {
+      const { id = "", username = "", password = "" } = req.body ?? {};
+      const p = pending.get(id);
+      if (!p) return res.status(400).type("text").send("This sign-in link has expired. Go back to Claude and connect again.");
       try {
-        const outlets = await authenticate(req.headers.authorization);
-        if (!outlets) return send(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
-        const server = createServer(outlets);
-        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-        res.on("close", () => { transport.close(); server.close(); });
-        await server.connect(transport);
-        await transport.handleRequest(req, res);
+        const jwt = await medicoLogin(String(username).trim(), String(password));
+        if (!jwt) return loginPage(res, id, "Wrong username or password.", 401);
+        if (!(await authenticate(jwt))) return loginPage(res, id, "Your account does not have access to appointments.", 403);
+        pending.delete(id);
+        const code = randomId();
+        remember(codes, code, { clientId: p.clientId, codeChallenge: p.codeChallenge, redirectUri: p.redirectUri, jwt }, 5 * 60_000);
+        const back = new URL(p.redirectUri);
+        back.searchParams.set("code", code);
+        if (p.state) back.searchParams.set("state", p.state);
+        res.redirect(302, back.href);
       } catch (e) {
         console.error(e);
-        if (!res.headersSent) send(res, 500, { error: "internal error" });
+        loginPage(res, id, "Medico could not be reached. Try again in a moment.", 502);
       }
-    })
-    .listen(Number(process.env.PORT), host, () => console.error(`medico MCP listening on http://${host}:${process.env.PORT}/mcp`));
+    });
+  }
+
+  const bearer = requireBearerAuth({
+    verifier: provider,
+    ...(oauth && { resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(new URL("/mcp", PUBLIC_URL)) }),
+  });
+  app.post("/mcp", bearer, async (req, res) => {
+    try {
+      const server = createServer(req.auth.extra.outlets);
+      // Stateless mode: no sessions, a fresh server per request.
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => { transport.close(); server.close(); });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (e) {
+      console.error(e);
+      if (!res.headersSent) res.status(500).json({ error: "internal error" });
+    }
+  });
+  app.all("/mcp", (req, res) => res.status(405).set("allow", "POST").json({ error: "method not allowed" }));
+
+  app.listen(Number(process.env.PORT), host, () => console.error(`medico MCP listening on http://${host}:${process.env.PORT}/mcp`));
 } else {
   await createServer(null).connect(new StdioServerTransport());
 }
