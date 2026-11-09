@@ -7,12 +7,14 @@ and never handle a token.
 Every connection runs with `default_transaction_read_only=on`, so it cannot change data.
 
 ## Tools
-- `list_appointments` – filter by `outlet_id`, `from`/`to` (ISO 8601, on `started_at`), `status` (`OPENED|COMPLETED|CANCELED`), `doctor_id`, `patient_id`, `patient_name` (partial), `limit` (default 50, max 500). Newest first. Includes doctor, admin and outlet names.
+- `list_appointments` – filter by `outlet_id`, `from`/`to` (ISO 8601, on `started_at`), `created_from`/`created_to` (on `created_date`), `status` (`OPENED|COMPLETED|CANCELED`), `doctor_id`, `patient_id`, `patient_name` (partial), `limit` (default 50, max 500), `order_by` (`started_at` default, or `created_date`). Newest first. Includes doctor, admin, outlet and creator names.
 - `get_appointment` – one appointment by `id`.
-- `count_appointments_by_day` – counts per day and status in a range (`timezone` defaults to `Asia/Jakarta`).
+- `count_appointments_by_day` – counts per day and status in a range (`timezone` defaults to `Asia/Jakarta`). `by=started_at` (default) buckets by appointment day; `by=created_date` buckets by the day the booking was made, i.e. bookings created per day.
 - `list_outlets` – outlet ids and names.
 
 Times are returned as ISO strings (UTC); the DB stores epoch milliseconds.
+`created_date` is when the booking was made (set once by medico-service); `updated_date` changes on every edit.
+Rows with no recorded creation time (stored as `0`) return `created_date: null`.
 
 ## Setup
 ```
@@ -62,6 +64,10 @@ The read-only role also needs:
 ```sql
 GRANT SELECT (id, name, mark_for_delete) ON users TO medico_mcp;
 GRANT SELECT (user_id, outlet_id, authority) ON user_authorities TO medico_mcp;
+```
+If the role has column-level grants on `appointments` instead of table-wide `SELECT`, also run:
+```sql
+GRANT SELECT (created_date, created_by) ON appointments TO medico_mcp;
 ```
 
 ### VM setup
