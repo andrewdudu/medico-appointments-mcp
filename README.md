@@ -12,7 +12,7 @@ Every connection runs with `default_transaction_read_only=on`, so it cannot chan
 - `count_appointments_by_day` – counts per day and status in a range (`timezone` defaults to `Asia/Jakarta`). `by=started_at` (default) buckets by appointment day; `by=created_date` buckets by the day the booking was made, i.e. bookings created per day.
 - `list_outlets` – outlet ids and names.
 
-Times are returned as ISO strings (UTC); the DB stores epoch milliseconds.
+Times are returned as ISO strings in WIB with an explicit offset, e.g. `2026-11-09T02:24:39.000+07:00`, so the date shown is the local date. The DB stores real epoch milliseconds (medico-service converts its WIB clock to epoch). Set `TIMEZONE` to another IANA zone to change the output zone.
 `created_date` is when the booking was made (set once by medico-service); `updated_date` changes on every edit.
 Rows with no recorded creation time (stored as `0`) return `created_date: null`.
 

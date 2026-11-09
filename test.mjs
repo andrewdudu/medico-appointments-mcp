@@ -24,7 +24,7 @@ insert into outlets values ('o1','JKT','Klinik Jakarta','Jakarta',false),('o2','
 insert into appointments values
  ('a1','o1','p1','Andi','d1','u1','OPENED',1794186000000,1794189600000,'0812','first',1793840400000,'u1',1794186000000,'u1',0),
  ('a2','o1','p2','Rina','d1','u1','COMPLETED',1794272400000,1794276000000,'0813',null,1793844000000,'u1',1794272400000,'u1',0),
- ('a3','o1','p1','Andi',null,'u1','CANCELED',1794272500000,1794276100000,'0812',null,1793926800000,'d1',1794272500000,'u1',0),
+ ('a3','o1','p1','Andi',null,'u1','CANCELED',1794272500000,1794276100000,'0812',null,1793906640000,'d1',1794272500000,'u1',0),
  ('a4','o2','p3','Joko','d1','u1','OPENED',1794100000000,1794103600000,'0814',null,0,null,1794100000000,'u1',0);`);
 
 const env = { ...process.env, DATABASE_URL: url };
@@ -42,9 +42,12 @@ let [, d] = await call("list_appointments", {}); assert.equal(d.length, 4); asse
 [, d] = await call("list_appointments", { outlet_id: "o1", status: "OPENED" }); assert.deepEqual(d.map(x => x.id), ["a1"]);
 [, d] = await call("list_appointments", { from: "2026-11-10T00:00:00+07:00", patient_name: "and" }); assert.deepEqual(d.map(x => x.id), ["a3"]);
 [, d] = await call("get_appointment", { id: "a2" }); assert.equal(d.doctor_name, "Dr. Budi");
-assert.equal(d.created_date, "2026-11-05T02:00:00.000Z"); assert.equal(d.created_by_name, "Admin Sari");
+assert.equal(d.created_date, "2026-11-05T09:00:00.000+07:00");
+assert.equal(d.started_at, "2026-11-10T08:00:00.000+07:00"); assert.equal(d.created_by_name, "Admin Sari");
 [, d] = await call("get_appointment", { id: "a4" }); assert.equal(d.created_date, null); // legacy 0 -> null
 [, d] = await call("list_appointments", { created_from: "2026-11-06T00:00:00+07:00" }); assert.deepEqual(d.map(x => x.id), ["a3"]);
+// a3 was booked 02:24 WIB = 19:24Z the day before; it must show and count as the WIB day.
+assert.equal(d[0].created_date, "2026-11-06T02:24:00.000+07:00");
 [, d] = await call("list_appointments", { order_by: "created_date", limit: 2 }); assert.deepEqual(d.map(x => x.id), ["a3", "a2"]);
 [, d] = await call("count_appointments_by_day", { from: "2026-11-01", to: "2026-11-30", outlet_id: "o1", by: "created_date" });
 assert.deepEqual(d, [{ day: "2026-11-05", status: "COMPLETED", count: 1 }, { day: "2026-11-05", status: "OPENED", count: 1 }, { day: "2026-11-06", status: "CANCELED", count: 1 }]);

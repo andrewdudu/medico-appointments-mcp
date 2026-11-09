@@ -25,8 +25,22 @@ const toMillis = (s) => {
   if (Number.isNaN(ms)) throw new Error(`Invalid date: ${s}`);
   return ms;
 };
+// Times go out as ISO 8601 in the clinics' local zone with an explicit offset (2026-11-09T02:24:39.000+07:00),
+// so the date shown is the local date and nobody has to remember to add 7 hours to a UTC string.
+const TIMEZONE = process.env.TIMEZONE ?? "Asia/Jakarta";
+const localParts = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23", timeZoneName: "longOffset",
+});
 // 0 means "not recorded" (some migrated rows), so report it as null rather than 1970.
-const iso = (ms) => (ms == null || Number(ms) === 0 ? null : new Date(Number(ms)).toISOString());
+const iso = (ms) => {
+  if (ms == null || Number(ms) === 0) return null;
+  const d = new Date(Number(ms));
+  const p = Object.fromEntries(localParts.formatToParts(d).map((x) => [x.type, x.value]));
+  const offset = p.timeZoneName === "GMT" ? "+00:00" : p.timeZoneName.slice(3); // "GMT+07:00" -> "+07:00"
+  const millis = String(d.getUTCMilliseconds()).padStart(3, "0");
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}.${millis}${offset}`;
+};
 
 const SELECT = `
   SELECT a.id, a.outlet_id, o.name AS outlet_name, a.patient_id, a.patient_name, a.phone_number,
@@ -59,7 +73,7 @@ function createServer(allowedOutlets) {
     return outletId ? [outletId] : allowedOutlets;
   };
 
-  const server = new McpServer({ name: "medico-appointments", version: "1.3.0" });
+  const server = new McpServer({ name: "medico-appointments", version: "1.3.1" });
 
   server.registerTool(
     "list_appointments",
@@ -67,7 +81,8 @@ function createServer(allowedOutlets) {
       description:
         "List appointments. Filter by outlet, appointment time (from/to), booking creation time (created_from/created_to), " +
         "status, doctor or patient. created_date is when the booking was made; updated_date changes on every edit. " +
-        "Dates are ISO 8601; include a timezone offset (e.g. 2026-11-07T00:00:00+07:00) to avoid UTC interpretation.",
+        "Times in results are local (Asia/Jakarta, WIB) with a +07:00 offset, so the date shown is the WIB date. " +
+        "Input dates are ISO 8601; include a timezone offset (e.g. 2026-11-07T00:00:00+07:00) to avoid UTC interpretation.",
       inputSchema: {
         outlet_id: z.string().optional(),
         from: z.string().optional().describe("Appointments starting at or after this time"),
