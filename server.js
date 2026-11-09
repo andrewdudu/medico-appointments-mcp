@@ -19,27 +19,31 @@ const pool = new pg.Pool({
   options: "-c default_transaction_read_only=on",
 });
 
-// started_at / ended_at / updated_date are stored as epoch milliseconds.
+// started_at / ended_at / created_date / updated_date are stored as epoch milliseconds.
 const toMillis = (s) => {
   const ms = Date.parse(s);
   if (Number.isNaN(ms)) throw new Error(`Invalid date: ${s}`);
   return ms;
 };
-const iso = (ms) => (ms == null ? null : new Date(Number(ms)).toISOString());
+// 0 means "not recorded" (some migrated rows), so report it as null rather than 1970.
+const iso = (ms) => (ms == null || Number(ms) === 0 ? null : new Date(Number(ms)).toISOString());
 
 const SELECT = `
   SELECT a.id, a.outlet_id, o.name AS outlet_name, a.patient_id, a.patient_name, a.phone_number,
          a.doctor_id, d.name AS doctor_name, a.admin_id, ad.name AS admin_name,
-         a.status, a.started_at, a.ended_at, a.notes, a.updated_date, a.updated_by
+         a.status, a.started_at, a.ended_at, a.notes,
+         a.created_date, a.created_by, cb.name AS created_by_name, a.updated_date, a.updated_by
   FROM appointments a
   LEFT JOIN users d ON d.id = a.doctor_id
   LEFT JOIN users ad ON ad.id = a.admin_id
+  LEFT JOIN users cb ON cb.id = a.created_by
   LEFT JOIN outlets o ON o.id = a.outlet_id`;
 
 const shape = (r) => ({
   ...r,
   started_at: iso(r.started_at),
   ended_at: iso(r.ended_at),
+  created_date: iso(r.created_date),
   updated_date: iso(r.updated_date),
 });
 
@@ -55,23 +59,27 @@ function createServer(allowedOutlets) {
     return outletId ? [outletId] : allowedOutlets;
   };
 
-  const server = new McpServer({ name: "medico-appointments", version: "1.2.0" });
+  const server = new McpServer({ name: "medico-appointments", version: "1.3.0" });
 
   server.registerTool(
     "list_appointments",
     {
       description:
-        "List appointments, newest first. Filter by outlet, start-time range, status, doctor or patient. " +
+        "List appointments. Filter by outlet, appointment time (from/to), booking creation time (created_from/created_to), " +
+        "status, doctor or patient. created_date is when the booking was made; updated_date changes on every edit. " +
         "Dates are ISO 8601; include a timezone offset (e.g. 2026-11-07T00:00:00+07:00) to avoid UTC interpretation.",
       inputSchema: {
         outlet_id: z.string().optional(),
         from: z.string().optional().describe("Appointments starting at or after this time"),
         to: z.string().optional().describe("Appointments starting at or before this time"),
+        created_from: z.string().optional().describe("Bookings created at or after this time"),
+        created_to: z.string().optional().describe("Bookings created at or before this time"),
         status: z.enum(["OPENED", "COMPLETED", "CANCELED"]).optional(),
         doctor_id: z.string().optional(),
         patient_id: z.string().optional(),
         patient_name: z.string().optional().describe("Case-insensitive partial match"),
         limit: z.number().int().min(1).max(500).default(50),
+        order_by: z.enum(["started_at", "created_date"]).default("started_at").describe("Sort field, newest first"),
       },
     },
     async (a) => {
@@ -82,13 +90,15 @@ function createServer(allowedOutlets) {
       if (outlets) add("a.outlet_id = ANY(?)", outlets);
       if (a.from) add("a.started_at >= ?", toMillis(a.from));
       if (a.to) add("a.started_at <= ?", toMillis(a.to));
+      if (a.created_from) add("a.created_date >= ?", toMillis(a.created_from));
+      if (a.created_to) add("a.created_date <= ?", toMillis(a.created_to));
       if (a.status) add("a.status = ?", a.status);
       if (a.doctor_id) add("a.doctor_id = ?", a.doctor_id);
       if (a.patient_id) add("a.patient_id = ?", a.patient_id);
       if (a.patient_name) add("a.patient_name ILIKE ?", `%${a.patient_name}%`);
       params.push(a.limit);
       const { rows } = await pool.query(
-        `${SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY a.started_at DESC LIMIT $${params.length}`,
+        `${SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY a.${a.order_by === "created_date" ? "created_date" : "started_at"} DESC, a.id LIMIT $${params.length}`,
         params,
       );
       return json(rows.map(shape));
@@ -107,19 +117,23 @@ function createServer(allowedOutlets) {
   server.registerTool(
     "count_appointments_by_day",
     {
-      description: "Count appointments per day (and per status) in a start-time range, optionally for one outlet.",
+      description:
+        "Count appointments per day and status, optionally for one outlet. by=started_at (default) buckets by appointment day; " +
+        "by=created_date buckets by the day the booking was made (bookings created per day).",
       inputSchema: {
         from: z.string(),
         to: z.string(),
         outlet_id: z.string().optional(),
+        by: z.enum(["started_at", "created_date"]).default("started_at").describe("Which date to range and bucket on"),
         timezone: z.string().default("Asia/Jakarta").describe("IANA zone used to bucket days"),
       },
     },
-    async ({ from, to, outlet_id, timezone }) => {
+    async ({ from, to, outlet_id, timezone, by }) => {
+      const col = by === "created_date" ? "created_date" : "started_at"; // whitelisted, safe to interpolate
       const { rows } = await pool.query(
-        `SELECT to_char(to_timestamp(started_at / 1000.0) AT TIME ZONE $3, 'YYYY-MM-DD') AS day, status, COUNT(*)::int AS count
+        `SELECT to_char(to_timestamp(${col} / 1000.0) AT TIME ZONE $3, 'YYYY-MM-DD') AS day, status, COUNT(*)::int AS count
          FROM appointments
-         WHERE started_at BETWEEN $1 AND $2 AND ($4::text[] IS NULL OR outlet_id = ANY($4))
+         WHERE ${col} BETWEEN $1 AND $2 AND ($4::text[] IS NULL OR outlet_id = ANY($4))
          GROUP BY 1, 2 ORDER BY 1, 2`,
         [toMillis(from), toMillis(to), timezone, scope(outlet_id)],
       );
